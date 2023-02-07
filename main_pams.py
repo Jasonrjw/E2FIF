@@ -1,0 +1,288 @@
+import torch
+
+import utility_pams
+import data
+import model
+import loss
+from option import args
+from trainer import Trainer
+import pdb
+
+from model.edsr_pams import PAMS_EDSR
+from model.edsr_org import EDSR
+from utils import common as util
+from utils.common import AverageMeter
+from tensorboardX import SummaryWriter
+from torch.optim.lr_scheduler import StepLR
+from tqdm import tqdm
+from decimal import Decimal
+import torch.nn.functional as F
+
+torch.manual_seed(args.seed)
+checkpoint = utility_pams.checkpoint(args)
+
+device = torch.device('cpu' if args.cpu else f'cuda:{args.gpus}')
+
+class Trainer():
+    def __init__(self, args, loader, t_model, s_model, ckp):
+        self.args = args
+        self.scale = args.scale
+
+        self.epoch = 0
+        self.ckp = ckp
+        self.loader_train = loader.loader_train
+        self.loader_test = loader.loader_test
+        self.t_model = t_model
+        self.s_model = s_model
+        arch_param = [v for k, v in self.s_model.named_parameters() if 'alpha' not in k]
+        alpha_param = [v for k, v in self.s_model.named_parameters() if 'alpha' in k]
+
+        params = [{'params': arch_param}, {'params': alpha_param, 'lr': 1e-2}]
+
+        self.optimizer = torch.optim.Adam(params, lr=args.lr, betas = args.betas, eps=args.epsilon)
+        self.sheduler = StepLR(self.optimizer, step_size=int(args.decay), gamma=args.gamma)
+        self.writer_train = SummaryWriter(ckp.dir + '/run/train')
+        
+        # if args.resume is not None:
+        #     ckpt = torch.load(args.resume)
+        #     self.epoch = ckpt['epoch']
+        #     print(f"Continue from {self.epoch}")
+        #     self.s_model.load_state_dict(ckpt['state_dict'])
+        #     self.optimizer.load_state_dict(ckpt['optimizer'])
+        #     self.sheduler.load_state_dict(ckpt['scheduler'])
+
+        self.losses = AverageMeter()
+        self.att_losses = AverageMeter()
+        self.nor_losses = AverageMeter()
+
+    def train(self):
+        self.sheduler.step(self.epoch)
+        self.epoch = self.epoch + 1
+        lr = self.optimizer.state_dict()['param_groups'][0]['lr']
+
+        self.writer_train.add_scalar(f'lr', lr, self.epoch)
+        self.ckp.write_log(
+            '[Epoch {}]\tLearning rate: {:.2e}'.format(self.epoch, Decimal(lr))
+        )
+
+        self.t_model.eval()
+        self.s_model.train()
+        
+        self.s_model.apply(lambda m: setattr(m, 'epoch', self.epoch))
+        
+        num_iterations = len(self.loader_train)
+        timer_data, timer_model = utility_pams.timer(), utility_pams.timer()
+        
+        self.loader_train.dataset.set_scale(0)
+        for batch, (lr, hr, _,) in enumerate(self.loader_train):
+            num_iters = num_iterations * (self.epoch-1) + batch
+
+            lr, hr = self.prepare(lr, hr)
+            #pdb.set_trace()
+            data_size = lr.size(0) 
+            
+            timer_data.hold()
+            timer_model.tic()
+
+            self.optimizer.zero_grad()
+
+            # if hasattr(self.t_model, 'set_scale'):
+            #     self.t_model.set_scale(idx_scale)
+            # if hasattr(self.s_model, 'set_scale'):
+            #     self.s_model.set_scale(idx_scale)
+
+            with torch.no_grad():
+                t_sr, t_res = self.t_model(lr)
+            
+            s_sr, s_res = self.s_model(lr)
+            #pdb.set_trace()
+            nor_loss = args.w_l1 * F.l1_loss(s_sr, hr)
+            att_loss = args.w_at * util.at_loss(s_res, t_res)
+
+            loss = nor_loss  + att_loss
+
+            loss.backward()
+            self.optimizer.step()
+
+            timer_model.hold()
+
+            self.losses.update(loss.item(),data_size)
+            display_loss = f'Loss: {self.losses.avg: .3f}'
+
+            if (batch + 1) % self.args.print_every == 0:
+                self.ckp.write_log('[{}/{}]\t{}\t{:.1f}+{:.1f}s'.format(
+                    (batch + 1) * self.args.batch_size,
+                    len(self.loader_train.dataset),
+                    display_loss,
+                    timer_model.release(),
+                    timer_data.release()))
+
+            timer_data.tic()
+        
+            for name, value in self.s_model.named_parameters():
+                if 'alpha' in name:
+                    if value.grad is not None:
+                        self.writer_train.add_scalar(f'{name}_grad', value.grad.cpu().data.numpy(), num_iters)
+                        self.writer_train.add_scalar(f'{name}_data', value.cpu().data.numpy(), num_iters)
+
+
+    def test(self, is_teacher=False):
+        torch.set_grad_enabled(False)
+        epoch = self.epoch
+        self.ckp.write_log('\nEvaluation:')
+        self.ckp.add_log(
+            torch.zeros(1, len(self.loader_test), len(self.scale))
+        )
+
+        self.ckp.add_log_ssim(
+            torch.zeros(1, len(self.loader_test), len(self.scale))
+        )
+        if is_teacher:
+            model = self.t_model
+        else:
+            model = self.s_model
+        model.eval()
+        timer_test = utility_pams.timer()
+        
+        if self.args.save_results: self.ckp.begin_background()
+        for idx_data, d in enumerate(self.loader_test):
+            for idx_scale, scale in enumerate(self.scale):
+                d.dataset.set_scale(idx_scale)
+                i = 0
+                for lr, hr, filename in tqdm(d, ncols=80):
+                    i += 1
+                    lr, hr = self.prepare(lr, hr)
+                    sr, s_res = model(lr)
+                    sr = utility_pams.quantize(sr, self.args.rgb_range)
+                    save_list = [sr]
+                    #calculate psnr
+                    cur_psnr = utility_pams.calc_psnr(
+                        sr, hr, scale, self.args.rgb_range, dataset=d
+                    )
+                    self.ckp.log[-1, idx_data, idx_scale] += cur_psnr
+
+                    #calculate ssim
+                    ssim = utility_pams.calc_ssim(
+                        sr, hr, scale
+                    )
+
+                    # #使用和e2fif中相同的方法计算ssim
+                    # ssim = utility_pams.new_ssim(
+                    #     hr, sr, scale
+                    # )
+
+                    self.ckp.log_ssim[-1, idx_data, idx_scale] += ssim
+
+                    if self.args.save_gt:
+                        save_list.extend([lr, hr])
+
+                    if self.args.save_results:
+                        save_name = f'{args.k_bits}bit_{filename[0]}'
+                        self.ckp.save_results(d, save_name, save_list, scale)
+
+                self.ckp.log[-1, idx_data, idx_scale] /= len(d)
+                self.ckp.log_ssim[-1, idx_data, idx_scale] /= len(d)
+                
+                ''' 记录best ssim '''
+                best_ssim = self.ckp.log_ssim.max(0)
+                best_psnr = self.ckp.log.max(0)
+
+                # self.ckp.write_log(
+                #     '[{} x{}] PSNR: {:.3f}  (Best: {:.3f} @epoch {})'.format(
+                #         d.dataset.name,
+                #         scale,
+                #         self.ckp.log[-1, idx_data, idx_scale],
+                #         best_psnr[0][idx_data, idx_scale],
+                #         best_psnr[1][idx_data, idx_scale] + 1
+                #     )
+                # )
+
+                self.ckp.write_log(
+                    '[{} x{}]\tPSNR: {:.3f} (Best_PSNR: {:.3f}, Best_SSIM: {:.3f} @epoch {})'.format(
+                        d.dataset.name,
+                        scale,
+                        self.ckp.log[-1, idx_data, idx_scale],
+                        best_psnr[0][idx_data, idx_scale],
+                        best_ssim[0][idx_data, idx_scale],
+                        best_psnr[1][idx_data, idx_scale] + 1
+                    )
+                )
+
+                self.writer_train.add_scalar(f'psnr', self.ckp.log[-1, idx_data, idx_scale], self.epoch)
+
+        if self.args.save_results:
+            self.ckp.end_background()
+            
+        if not self.args.test_only:
+            is_best = (best_psnr[1][0, 0] + 1 == epoch)
+
+            state = {
+            'epoch': epoch,
+            'state_dict': self.s_model.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+            'scheduler': self.sheduler.state_dict()
+        }
+            util.save_checkpoint(state, is_best, checkpoint =self.ckp.dir + '/model')
+        
+        self.ckp.write_log(
+            'Total: {:.2f}s\n'.format(timer_test.toc()), refresh=True
+        )
+
+        torch.set_grad_enabled(True)
+
+    def prepare(self, *args):
+        def _prepare(tensor):
+            if self.args.precision == 'half': tensor = tensor.half()
+            return tensor.cuda()
+
+        return [_prepare(a) for a in args]
+
+    def terminate(self):
+        if self.args.test_only:
+            self.test()
+            return True
+        else:
+            return self.epoch >= self.args.epochs
+
+def main():
+    if checkpoint.ok:
+        loader = data.Data(args)
+        if args.model.lower() == 'edsr_pams':
+            t_model = EDSR(args, is_teacher=True).to(device)
+            s_model = PAMS_EDSR(args, bias=True).to(device)
+        # elif args.model.lower() == 'rdn':
+        #     t_model = RDN(args, is_teacher=True).to(device)
+        #     s_model = PAMS_RDN(args).to(device)
+        else:
+            raise ValueError('not expected model = {}'.format(args.model))
+
+        if args.pre_train is not None:
+            t_checkpoint = torch.load(args.pre_train) 
+            t_model.load_state_dict(t_checkpoint, strict=False)
+        
+        if args.test_only:
+            if args.refine is None:
+                ckpt = torch.load(f'{args.save}/model/model_best.pth.tar')
+                refine_path = f'{args.save}/model/model_best.pth.tar'
+            else:
+                ckpt = torch.load(f'{args.refine}')
+                refine_path = args.refine
+
+            s_checkpoint = ckpt['state_dict'] if 'state_dict' in ckpt else ckpt
+            s_model.load_state_dict(s_checkpoint)
+            #s_model.load_state_dict(ckpt, strict=False)
+            print(f"Load model from {refine_path}")
+
+        t = Trainer(args, loader, t_model, s_model, checkpoint)
+        
+        print(f'{args.save} start!')
+        while not t.terminate():
+            t.train()
+            t.test()
+
+        checkpoint.done()
+        print(f'{args.save} done!')
+
+
+if __name__ == '__main__':
+    main()

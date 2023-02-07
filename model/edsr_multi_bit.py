@@ -5,63 +5,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 import functools
 import pdb
+from utils.quant_ops_new import QuantizeConv
+
 
 def make_model(args, parent=False):
     return EDSR(args)
 
 
-class Q_A(torch.autograd.Function):  # dorefanet, but constrain to {-1, 1}
-    @staticmethod
-    def forward(ctx, x):
-        ctx.save_for_backward(x)
-        return x.sign()                     
-    @staticmethod
-    def backward(ctx, grad_output):
-        input, = ctx.saved_tensors
-        grad_input = (2 - torch.abs(2*input))
-        grad = grad_input.clamp(0) * grad_output.clone()
-        return grad
-
-class Q_W(torch.autograd.Function):  # xnor-net, but gradient use identity approximation
-    @staticmethod
-    def forward(ctx, x):
-        return x.sign()
-    @staticmethod
-    def backward(ctx, grad):
-        return grad
-
-class BinaryConv(nn.Conv2d):
-    def __init__(self, in_channels, out_channels, kernel_size, bitW=1, stride=1, padding=0, bias=True, groups=1, mode='binary'):
-        super(BinaryConv, self).__init__(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias, groups=groups)
-        self.groups = groups
-        self.bitW = bitW
-        self.padding = padding
-        self.stride = stride
-        self.change_nums = 0
-        self.mode = mode
-        assert self.mode in ['pretrain', 'binary', 'binaryactonly']
-        print('conv mode : {}'.format(self.mode))
-
-    def forward(self, input):
-
-        if self.mode == 'binaryactonly' or self.mode == 'binary':
-            input = Q_A.apply(input)
-        elif self.mode == 'pretrain':
-            pass
-        else:
-            assert False
-            
-        if self.mode == 'binaryactonly' or self.mode == 'pretrain':
-            weight = self.weight
-        elif self.mode == 'binary':
-            weight = Q_W.apply(self.weight)
-        else:
-            assert False
-        output = F.conv2d(input, weight, bias=self.bias, stride=self.stride, padding=self.padding, dilation=self.dilation, groups=self.groups)
-        return output
-
-
-class BasicBlock(nn.Module):
+class BasicBlock(nn.Module):  #用于head
     def __init__(
         self, conv, in_channels, out_channels, kernel_size, bn=True):
 
@@ -78,22 +29,32 @@ class BasicBlock(nn.Module):
         else:
             return self.conv1(x)
 
-class ResBlock(nn.Module):
+class ResBlock(nn.Module): #用于body
     def __init__(
-        self, conv, n_feats, kernel_size,
+        self, conv, n_feats, kernel_size, weight_bits, input_bits, learnable,
+        symmetric1, symmetric2, weight_layerwise, input_layerwise,
+        weight_quant_method, input_quant_method1, input_quant_method2,
         bias=True, act=functools.partial(nn.LeakyReLU, negative_slope=0.1, inplace=True), res_scale=1):
 
         super(ResBlock, self).__init__()
         #pdb.set_trace()
         self.conv1 = nn.Sequential(
-            conv(n_feats, n_feats, kernel_size, padding=(kernel_size//2,kernel_size//2), bias=bias),
-            #nn.BatchNorm2d(n_feats)
+            conv(n_feats, n_feats, kernel_size, padding=(kernel_size//2,kernel_size//2), bias=bias,
+                weight_bits=weight_bits, input_bits=input_bits, 
+                learnable=learnable, symmetric=symmetric1, 
+                weight_layerwise=weight_layerwise, input_layerwise=input_layerwise,
+                weight_quant_method=weight_quant_method, input_quant_method=input_quant_method1),
+            nn.BatchNorm2d(n_feats)
         )
         self.act = act() #used for LeakyReLU
         #self.act = act  #used for PReLU
         self.conv2 = nn.Sequential(
-            conv(n_feats, n_feats, kernel_size, padding=(kernel_size//2,kernel_size//2), bias=bias),
-            #nn.BatchNorm2d(n_feats)
+            conv(n_feats, n_feats, kernel_size, padding=(kernel_size//2,kernel_size//2), bias=bias,
+                weight_bits=weight_bits, input_bits=input_bits, 
+                learnable=learnable, symmetric=symmetric2, 
+                weight_layerwise=weight_layerwise, input_layerwise=input_layerwise,
+                weight_quant_method=weight_quant_method, input_quant_method=input_quant_method2),
+            nn.BatchNorm2d(n_feats)
         )
         self.res_scale = res_scale
 
@@ -107,10 +68,8 @@ class ResBlock(nn.Module):
 
 
 class EDSR(nn.Module):
-    def __init__(self, args, conv=BinaryConv): #这里定义了conv的类型
+    def __init__(self, args, conv=QuantizeConv): #这里定义了conv的类型
         super(EDSR, self).__init__()
-
-        conv = functools.partial(conv, mode=args.binary_mode)
 
         n_resblocks = args.n_resblocks
         n_feats = args.n_feats
@@ -118,6 +77,17 @@ class EDSR(nn.Module):
         kernel_size = 3 
         scale = args.scale[0]
         self.need_mid_feas = args.need_mid_feas
+
+        weight_bits = args.weight_bits
+        input_bits = args.input_bits
+        learnable = args.learnable
+        symmetric1 = args.symmetric1
+        symmetric2 = args.symmetric2
+        weight_layerwise = args.weight_layerwise
+        input_layerwise = args.input_layerwise
+        weight_quant_method = args.weight_quant_method
+        input_quant_method1 = args.input_quant_method1
+        input_quant_method2 = args.input_quant_method2
 
         act = functools.partial(nn.LeakyReLU, negative_slope=0.1, inplace=True)
         #act = nn.PReLU()
@@ -140,8 +110,13 @@ class EDSR(nn.Module):
         # define body module
         m_body = [
             ResBlock(
-                conv, n_feats, kernel_size, act=act, res_scale=args.res_scale
-            ) for _ in range(n_resblocks)
+                conv, n_feats, kernel_size, act=act, res_scale=args.res_scale,
+                weight_bits=weight_bits, input_bits=input_bits, learnable=learnable,
+                symmetric1 = symmetric1, symmetric2=symmetric2, 
+                weight_layerwise = weight_layerwise, input_layerwise=input_layerwise,
+                weight_quant_method = weight_quant_method, input_quant_method1=input_quant_method1,
+                input_quant_method2=input_quant_method2
+                ) for _ in range(n_resblocks)
         ]
         # m_body.append(nn.Sequential(
         #     conv(n_feats, n_feats, kernel_size, padding=kernel_size//2),

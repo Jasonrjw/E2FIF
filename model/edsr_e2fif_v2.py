@@ -6,6 +6,8 @@ import torch.nn.functional as F
 import functools
 import pdb
 
+'''use layer norm instead of BN'''
+
 def make_model(args, parent=False):
     return EDSR(args)
 
@@ -79,30 +81,38 @@ class BasicBlock(nn.Module):
             return self.conv1(x)
 
 class ResBlock(nn.Module):
+
     def __init__(
         self, conv, n_feats, kernel_size,
-        bias=True, act=functools.partial(nn.LeakyReLU, negative_slope=0.1, inplace=True), res_scale=1):
+        bias=True, act=None, res_scale=1):
 
         super(ResBlock, self).__init__()
         #pdb.set_trace()
-        self.conv1 = nn.Sequential(
-            conv(n_feats, n_feats, kernel_size, padding=(kernel_size//2,kernel_size//2), bias=bias),
-            #nn.BatchNorm2d(n_feats)
-        )
+        self.conv1 = conv(n_feats, n_feats, kernel_size, padding=(kernel_size//2,kernel_size//2), bias=bias)
+        
         self.act = act() #used for LeakyReLU
         #self.act = act  #used for PReLU
-        self.conv2 = nn.Sequential(
-            conv(n_feats, n_feats, kernel_size, padding=(kernel_size//2,kernel_size//2), bias=bias),
-            #nn.BatchNorm2d(n_feats)
-        )
+        self.conv2 = conv(n_feats, n_feats, kernel_size, padding=(kernel_size//2,kernel_size//2), bias=bias)
+        
         self.res_scale = res_scale
+        self.norm1 = nn.LayerNorm(n_feats, eps=1e-6)
+        self.norm2 = nn.LayerNorm(n_feats, eps=1e-6)
+
 
     def forward(self, x):
-        # res = self.body(x).mul(self.res_scale)
-        # res += x
-        out = self.conv1(x).mul(self.res_scale) + x
-        out = self.act(out)
-        out = self.conv2(out).mul(self.res_scale) + out
+        input1 = x
+        x = x.permute(0, 2, 3, 1) # (N, C, H, W) -> (N, H, W, C)
+        out = self.norm1(x)
+        out = out.permute(0, 3, 1, 2) # (N, H, W, C) -> (N, C, H, W)
+        out = self.conv1(out).mul(self.res_scale) + input1
+
+        out1 = self.act(out)
+        input2 = out1
+
+        out1 = out1.permute(0, 2, 3, 1) # (N, C, H, W) -> (N, H, W, C)
+        out2 = self.norm2(out1)
+        out2 = out2.permute(0, 3, 1, 2) # (N, H, W, C) -> (N, C, H, W)
+        out2 = self.conv2(out2).mul(self.res_scale) + input2
         return out
 
 
@@ -119,8 +129,8 @@ class EDSR(nn.Module):
         scale = args.scale[0]
         self.need_mid_feas = args.need_mid_feas
 
-        act = functools.partial(nn.LeakyReLU, negative_slope=0.1, inplace=True)
-        #act = nn.PReLU()
+        act = functools.partial(nn.LeakyReLU, negative_slope=0.1)
+        #act = nn.PReLU(n_feats)
 
         # url_name = 'r{}f{}x{}'.format(n_resblocks, n_feats, scale)
         # if url_name in url:

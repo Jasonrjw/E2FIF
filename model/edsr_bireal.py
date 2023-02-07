@@ -5,6 +5,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import functools
 
+'''和edsr_e2fif的区别在于tail module'''
+
 def make_model(args, parent=False):
     return EDSR(args)
 

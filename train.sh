@@ -5,7 +5,7 @@ python -u main.py \
 --save edsr_e2fif \
 --res_scale 1 \
 --binary_mode binary \
---dir_data /home/zhangxiao/langzhiqiang/sr_data/ \
+--dir_data /home/rjwei/Data_raid/dataset \
 --epochs 300 \
 --decay 200 \
 --lr 2e-4 \

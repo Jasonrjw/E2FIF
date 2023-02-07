@@ -6,6 +6,8 @@ import torch.nn.functional as F
 import functools
 import pdb
 
+'''Data driven channel re-scaling '''
+
 def make_model(args, parent=False):
     return EDSR(args)
 
@@ -78,6 +80,25 @@ class BasicBlock(nn.Module):
         else:
             return self.conv1(x)
 
+
+class Channel_rescale(nn.Module):
+    def __init__(self, channel, reduction=8):
+        super().__init__()
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channel, channel // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channel // reduction, channel, bias=False),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y.expand_as(x)
+
+
 class ResBlock(nn.Module):
     def __init__(
         self, conv, n_feats, kernel_size,
@@ -87,23 +108,30 @@ class ResBlock(nn.Module):
         #pdb.set_trace()
         self.conv1 = nn.Sequential(
             conv(n_feats, n_feats, kernel_size, padding=(kernel_size//2,kernel_size//2), bias=bias),
-            #nn.BatchNorm2d(n_feats)
+            nn.BatchNorm2d(n_feats)
         )
-        self.act = act() #used for LeakyReLU
+        self.act1 = act() #used for LeakyReLU
         #self.act = act  #used for PReLU
+
+        #self.act2 = act()
+
         self.conv2 = nn.Sequential(
             conv(n_feats, n_feats, kernel_size, padding=(kernel_size//2,kernel_size//2), bias=bias),
-            #nn.BatchNorm2d(n_feats)
+            nn.BatchNorm2d(n_feats)
         )
         self.res_scale = res_scale
+        self.crs1 = Channel_rescale(channel=n_feats, reduction=8)
+        self.crs2 = Channel_rescale(channel=n_feats, reduction=8)
+
 
     def forward(self, x):
-        # res = self.body(x).mul(self.res_scale)
-        # res += x
-        out = self.conv1(x).mul(self.res_scale) + x
-        out = self.act(out)
-        out = self.conv2(out).mul(self.res_scale) + out
-        return out
+        out1 = self.conv1(x).mul(self.res_scale)
+        out1 = self.crs1(out1) + x
+        out1 = self.act1(out1)
+        out2 = self.conv2(out1).mul(self.res_scale) 
+        out2 = self.crs2(out2) + out1
+        #out2 = self.act2(out2)
+        return out2
 
 
 class EDSR(nn.Module):

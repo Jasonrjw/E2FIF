@@ -10,6 +10,7 @@ import numpy as np
 import imageio
 import torch
 import torch.utils.data as data
+import pdb
 
 class SRData(data.Dataset):
     def __init__(self, args, name='', train=True, benchmark=False):
@@ -106,18 +107,27 @@ class SRData(data.Dataset):
             with open(f, 'wb') as _f:
                 pickle.dump(imageio.imread(img), _f)
 
+    # def __getitem__(self, idx):
+    #     lr, hr, filename = self._load_file(idx)
+    #     pair = self.get_patch(lr, hr)
+    #     if self.args.need_rgb:
+    #         # pair_rgb = [np.copy(i) for i in pair]
+    #         pair_rgb = [sc.rgb2ycbcr(i) if len(i.shape)==3 else np.expand_dims(i, axis=2) for i in pair]
+    #         pair_rgb = common.np2Tensor(*pair_rgb, rgb_range=self.args.rgb_range)
+    #     pair = common.set_channel(*pair, n_channels=self.args.n_colors)
+    #     pair_t = common.np2Tensor(*pair, rgb_range=self.args.rgb_range)
+
+    #     if self.args.need_rgb:
+    #         return pair_t[0], pair_t[1], (pair_rgb[0], pair_rgb[1], filename)
+    #     return pair_t[0], pair_t[1], filename
+
     def __getitem__(self, idx):
         lr, hr, filename = self._load_file(idx)
         pair = self.get_patch(lr, hr)
-        if self.args.need_rgb:
-            # pair_rgb = [np.copy(i) for i in pair]
-            pair_rgb = [sc.rgb2ycbcr(i) if len(i.shape)==3 else np.expand_dims(i, axis=2) for i in pair]
-            pair_rgb = common.np2Tensor(*pair_rgb, rgb_range=self.args.rgb_range)
         pair = common.set_channel(*pair, n_channels=self.args.n_colors)
         pair_t = common.np2Tensor(*pair, rgb_range=self.args.rgb_range)
 
-        if self.args.need_rgb:
-            return pair_t[0], pair_t[1], (pair_rgb[0], pair_rgb[1], filename)
+        #pdb.set_trace()
         return pair_t[0], pair_t[1], filename
 
     def __len__(self):

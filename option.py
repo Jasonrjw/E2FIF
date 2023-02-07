@@ -9,7 +9,7 @@ parser.add_argument('--template', default='.',
                     help='You can set various templates in option.py')
 
 # Hardware specifications
-parser.add_argument('--n_threads', type=int, default=4,
+parser.add_argument('--n_threads', type=int, default=32,
                     help='number of threads for data loading')
 parser.add_argument('--cpu', action='store_true',
                     help='use cpu only')
@@ -21,9 +21,9 @@ parser.add_argument('--seed', type=int, default=1,
                     help='random seed')
 
 # Data specifications
-parser.add_argument('--dir_data', type=str, default='/data4/langzhiqiang/sr_data',
+parser.add_argument('--dir_data', type=str, default='/home/rjwei/Data_raid/dataset',
                     help='dataset directory')
-parser.add_argument('--dir_demo', type=str, default='../test',
+parser.add_argument('--dir_demo', type=str, default='test',
                     help='demo image directory')
 parser.add_argument('--data_train', type=str, default='DIV2K',
                     help='train dataset name')
@@ -56,7 +56,7 @@ parser.add_argument('--model', default='EDSR',
 
 parser.add_argument('--act', type=str, default='relu',
                     help='activation function')
-parser.add_argument('--pre_train', type=str, default='',
+parser.add_argument('--pre_train', type=str, default=None,
                     help='pre-trained model directory')
 parser.add_argument('--extend', type=str, default='.',
                     help='pre-trained model directory')
@@ -73,6 +73,36 @@ parser.add_argument('--dilation', action='store_true',
 parser.add_argument('--precision', type=str, default='single',
                     choices=('single', 'half'),
                     help='FP precision for test (single | half)')
+
+
+#quantization specifications
+parser.add_argument('--weight_bits', type=int, default=32,
+                    help='The k_bits of the quantzie')
+
+parser.add_argument('--input_bits', type=int, default=32,
+                    help='The k_bits of the quantzie')
+
+parser.add_argument('--weight_quant_method', type=str, default='twn',
+                    help='pre-trained model directory')
+
+parser.add_argument('--input_quant_method1', type=str, default='elastic_signed',
+                    help='pre-trained model directory')
+
+parser.add_argument('--input_quant_method2', type=str, default='elastic_unsigned',
+                    help='pre-trained model directory')
+
+parser.add_argument('--symmetric1', action='store_true', default=False,
+                    help='不加默认是False, 即第一个activation quantizer是asymmetric')
+
+parser.add_argument('--symmetric2', action='store_true', default=False,
+                    help='不加默认是False, 即第二个activation quantizer是asymmetric')
+
+parser.add_argument('--weight_layerwise', action='store_true', default=False,
+                    help='不加默认是False,即per channel quantize')
+
+parser.add_argument('--input_layerwise', action='store_true', default=False,
+                    help='不加默认是False,即per channel quantize') 
+
 
 # Option for Residual dense network (RDN)
 parser.add_argument('--n_convs', type=int, default=8,
@@ -105,6 +135,8 @@ parser.add_argument('--test_only', action='store_true',
                     help='set this option to test the model')
 parser.add_argument('--gan_k', type=int, default=1,
                     help='k value for adversarial loss')
+parser.add_argument('--initial', action='store_true',
+                    help='用train好的model initialize')
 
 # Optimization specifications
 parser.add_argument('--lr', type=float, default=5e-4,
@@ -127,6 +159,18 @@ parser.add_argument('--weight_decay', type=float, default=0,
 parser.add_argument('--gclip', type=float, default=0,
                     help='gradient clipping threshold (0 = no clipping)')
 
+# PAMS setting
+parser.add_argument('--k_bits', type=int, default=32,
+                    help='The k_bits of the quantzie')
+parser.add_argument('--ema_epoch', type=int, default=1,
+                    help='number of epochs to train')
+parser.add_argument('--w_l1', type=float, default=1.0,
+                    help='loss coefficient')
+parser.add_argument('--w_at', type=float, default=1e+3,
+                    help='loss coefficient') 
+parser.add_argument('--refine', type=str, default=None,
+                    help='refine model directory')
+                    
 # Loss specifications
 parser.add_argument('--loss', type=str, default='1*L1',
                     help='loss function configuration')
@@ -141,7 +185,8 @@ parser.add_argument('--postfix', type=str, default='',
 parser.add_argument('--load', type=str, default='',
                     help='file name to load')
 parser.add_argument('--resume', type=int, default=0,
-                    help='resume from specific checkpoint, -1: 从最新(最后一个)模型model_latest.pt导入，用于继续训练； \
+                    help='resume from specific checkpoint, -2: 从model_best.pt导入继续训练\
+                                                            -1: 从最新(最后一个)模型model_latest.pt导入，用于继续训练； \
                                                             0：从args.pre_train直接导入； \
                                                             其它数字：指定从第几个epoch继续训练')
 parser.add_argument('--save_models', action='store_true',
@@ -167,11 +212,12 @@ template.set_template(args)
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
 
-if args.load:
-    args.save = args.load
+# if args.load:
+#     args.save = args.load
 
 if not args.save:
     args.save = args.model.lower() + args.postfix
+
 args.save += '_{}_x{}'.format(args.binary_mode, args.scale)
 if 'edsr' in args.model.lower():
     args.save += '_n{}_c{}'.format(args.n_resblocks, args.n_feats)
@@ -183,8 +229,8 @@ else:
     assert False
 args.save += '_e{}_lr{}_b{}_p{}'.format(args.epochs, args.lr, args.batch_size, args.patch_size)
 
-if args.load:
-    args.load = args.save
+# if args.load:
+#     args.load = args.save
 
 args.scale = list(map(lambda x: int(x), args.scale.split('+')))
 args.data_train = args.data_train.split('+')

@@ -4,8 +4,10 @@ import imp
 import numpy as np
 import torch
 from torch import nn
-from skimage.measure import compare_ssim, compare_psnr
-# from skimage.metrics import structural_similarity
+#from skimage.measure import compare_ssim, compare_psnr
+from skimage.metrics import structural_similarity as compare_ssim
+from skimage.metrics import peak_signal_noise_ratio as compare_psnr
+from skimage.metrics import structural_similarity
 
 
 def batch_PSNR(im_true, im_fake, data_range=255):

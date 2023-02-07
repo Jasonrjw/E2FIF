@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.parallel as P
 import torch.utils.model_zoo
+import pdb
 
 class Model(nn.Module):
     def __init__(self, args, ckp):
@@ -36,8 +37,8 @@ class Model(nn.Module):
         if self.n_GPUs > 1:
             # self.model = nn.DataParallel(self.model)
             print('using dataparalle')
-        # print(self.model, file=ckp.log_file)
-
+        print(self.model, file=ckp.log_file)
+    
     def forward(self, x, idx_scale):
         self.idx_scale = idx_scale
         if hasattr(self.model, 'set_scale'):

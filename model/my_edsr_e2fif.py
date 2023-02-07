@@ -6,8 +6,13 @@ import torch.nn.functional as F
 import functools
 import pdb
 
+'''
+    去掉每个conv后面的bn
+    把leaky_ReLU改为ReLU
+'''
+
 def make_model(args, parent=False):
-    return EDSR(args)
+    return my_EDSR(args)
 
 
 class Q_A(torch.autograd.Function):  # dorefanet, but constrain to {-1, 1}
@@ -81,7 +86,9 @@ class BasicBlock(nn.Module):
 class ResBlock(nn.Module):
     def __init__(
         self, conv, n_feats, kernel_size,
-        bias=True, act=functools.partial(nn.LeakyReLU, negative_slope=0.1, inplace=True), res_scale=1):
+        bias=True, 
+        act=functools.partial(nn.LeakyReLU, negative_slope=0.1, inplace=True), 
+        res_scale=1):
 
         super(ResBlock, self).__init__()
         #pdb.set_trace()
@@ -89,8 +96,8 @@ class ResBlock(nn.Module):
             conv(n_feats, n_feats, kernel_size, padding=(kernel_size//2,kernel_size//2), bias=bias),
             #nn.BatchNorm2d(n_feats)
         )
-        self.act = act() #used for LeakyReLU
-        #self.act = act  #used for PReLU
+        #self.act = act()
+        self.act = nn.ReLU()
         self.conv2 = nn.Sequential(
             conv(n_feats, n_feats, kernel_size, padding=(kernel_size//2,kernel_size//2), bias=bias),
             #nn.BatchNorm2d(n_feats)
@@ -106,9 +113,9 @@ class ResBlock(nn.Module):
         return out
 
 
-class EDSR(nn.Module):
+class my_EDSR(nn.Module):
     def __init__(self, args, conv=BinaryConv): #这里定义了conv的类型
-        super(EDSR, self).__init__()
+        super(my_EDSR, self).__init__()
 
         conv = functools.partial(conv, mode=args.binary_mode)
 
@@ -118,10 +125,8 @@ class EDSR(nn.Module):
         kernel_size = 3 
         scale = args.scale[0]
         self.need_mid_feas = args.need_mid_feas
-
-        act = functools.partial(nn.LeakyReLU, negative_slope=0.1, inplace=True)
-        #act = nn.PReLU()
-
+        #act = functools.partial(nn.LeakyReLU, negative_slope=0.1, inplace=True)
+        act = nn.ReLU()
         # url_name = 'r{}f{}x{}'.format(n_resblocks, n_feats, scale)
         # if url_name in url:
         #     self.url = url[url_name]

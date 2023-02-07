@@ -10,58 +10,57 @@ def make_model(args, parent=False):
     return EDSR(args)
 
 
-class Q_A(torch.autograd.Function):  # dorefanet, but constrain to {-1, 1}
-    @staticmethod
-    def forward(ctx, x):
-        ctx.save_for_backward(x)
-        return x.sign()                     
-    @staticmethod
-    def backward(ctx, grad_output):
-        input, = ctx.saved_tensors
-        grad_input = (2 - torch.abs(2*input))
-        grad = grad_input.clamp(0) * grad_output.clone()
-        return grad
+class BinaryActivation(nn.Module):
+    def __init__(self):
+        super(BinaryActivation, self).__init__()
 
-class Q_W(torch.autograd.Function):  # xnor-net, but gradient use identity approximation
-    @staticmethod
-    def forward(ctx, x):
-        return x.sign()
-    @staticmethod
-    def backward(ctx, grad):
-        return grad
+    def forward(self, x):
+        out_forward = torch.sign(x)
+        mask1 = x < -1
+        mask2 = x < 0
+        mask3 = x < 1
+        out1 = (-1) * mask1.type(torch.float32) + (x*x + 2*x) * (1-mask1.type(torch.float32))
+        out2 = out1 * mask2.type(torch.float32) + (-x*x + 2*x) * (1-mask2.type(torch.float32))
+        out3 = out2 * mask3.type(torch.float32) + 1 * (1- mask3.type(torch.float32))
+        out = out_forward.detach() - out3.detach() + out3
 
-class BinaryConv(nn.Conv2d):
-    def __init__(self, in_channels, out_channels, kernel_size, bitW=1, stride=1, padding=0, bias=True, groups=1, mode='binary'):
-        super(BinaryConv, self).__init__(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias, groups=groups)
-        self.groups = groups
-        self.bitW = bitW
-        self.padding = padding
+        return out
+
+class LearnableBias(nn.Module):
+    def __init__(self, out_chn):
+        super(LearnableBias, self).__init__()
+        self.bias = nn.Parameter(torch.zeros(1,out_chn,1,1), requires_grad=True)
+
+    def forward(self, x):
+        out = x + self.bias.expand_as(x)
+        return out
+
+class BinaryConv(nn.Module):
+    def __init__(self, in_chn, out_chn, kernel_size=3, stride=1, padding=1):
+        super(BinaryConv, self).__init__()
         self.stride = stride
-        self.change_nums = 0
-        self.mode = mode
-        assert self.mode in ['pretrain', 'binary', 'binaryactonly']
-        print('conv mode : {}'.format(self.mode))
-
-    def forward(self, input):
-
-        if self.mode == 'binaryactonly' or self.mode == 'binary':
-            input = Q_A.apply(input)
-        elif self.mode == 'pretrain':
-            pass
-        else:
-            assert False
-            
-        if self.mode == 'binaryactonly' or self.mode == 'pretrain':
-            weight = self.weight
-        elif self.mode == 'binary':
-            weight = Q_W.apply(self.weight)
-        else:
-            assert False
-        output = F.conv2d(input, weight, bias=self.bias, stride=self.stride, padding=self.padding, dilation=self.dilation, groups=self.groups)
-        return output
+        self.padding = padding
+        self.number_of_weights = in_chn * out_chn * kernel_size * kernel_size
+        self.shape = (out_chn, in_chn, kernel_size, kernel_size)
+        self.weights = nn.Parameter(torch.rand((self.number_of_weights,1)) * 0.001, requires_grad=True)
+        self.binary_activation = BinaryActivation()
 
 
-class BasicBlock(nn.Module):
+    def forward(self, x):
+        real_weights = self.weights.view(self.shape)
+        scaling_factor = torch.mean(torch.mean(torch.mean(abs(real_weights),dim=3,keepdim=True),dim=2,keepdim=True),dim=1,keepdim=True)
+        #print(scaling_factor, flush=True)
+        scaling_factor = scaling_factor.detach()
+        binary_weights_no_grad = scaling_factor * torch.sign(real_weights)
+        cliped_weights = torch.clamp(real_weights, -1.0, 1.0)
+        binary_weights = binary_weights_no_grad.detach() - cliped_weights.detach() + cliped_weights
+        #print(binary_weights, flush=True)
+        x = self.binary_activation(x)
+        y = F.conv2d(x, binary_weights, stride=self.stride, padding=self.padding)
+
+        return y
+
+class BasicBlock(nn.Module): # head module
     def __init__(
         self, conv, in_channels, out_channels, kernel_size, bn=True):
 
@@ -78,39 +77,40 @@ class BasicBlock(nn.Module):
         else:
             return self.conv1(x)
 
-class ResBlock(nn.Module):
+class ResBlock(nn.Module): # body module 
     def __init__(
-        self, conv, n_feats, kernel_size,
-        bias=True, act=functools.partial(nn.LeakyReLU, negative_slope=0.1, inplace=True), res_scale=1):
+        self, n_feats, kernel_size,
+        bias=True, res_scale=1):
 
         super(ResBlock, self).__init__()
-        #pdb.set_trace()
-        self.conv1 = nn.Sequential(
-            conv(n_feats, n_feats, kernel_size, padding=(kernel_size//2,kernel_size//2), bias=bias),
-            #nn.BatchNorm2d(n_feats)
-        )
-        self.act = act() #used for LeakyReLU
-        #self.act = act  #used for PReLU
-        self.conv2 = nn.Sequential(
-            conv(n_feats, n_feats, kernel_size, padding=(kernel_size//2,kernel_size//2), bias=bias),
-            #nn.BatchNorm2d(n_feats)
-        )
+        self.move1 = LearnableBias(n_feats)
+
+        self.conv = BinaryConv(n_feats, n_feats, kernel_size, padding=(kernel_size//2,kernel_size//2))
+
+        self.move21 = LearnableBias(n_feats)
+        self.prelu = nn.PReLU(n_feats)
+        self.move22 = LearnableBias(n_feats)
+
         self.res_scale = res_scale
 
     def forward(self, x):
         # res = self.body(x).mul(self.res_scale)
         # res += x
-        out = self.conv1(x).mul(self.res_scale) + x
-        out = self.act(out)
-        out = self.conv2(out).mul(self.res_scale) + out
+        out = self.move1(x)
+
+        out = self.conv(out)
+
+        out = self.move21(out)
+        out = self.prelu(out)
+        out = self.move22(out)
+
+        out = out + x
         return out
 
 
 class EDSR(nn.Module):
-    def __init__(self, args, conv=BinaryConv): #这里定义了conv的类型
+    def __init__(self, args): 
         super(EDSR, self).__init__()
-
-        conv = functools.partial(conv, mode=args.binary_mode)
 
         n_resblocks = args.n_resblocks
         n_feats = args.n_feats
@@ -118,9 +118,6 @@ class EDSR(nn.Module):
         kernel_size = 3 
         scale = args.scale[0]
         self.need_mid_feas = args.need_mid_feas
-
-        act = functools.partial(nn.LeakyReLU, negative_slope=0.1, inplace=True)
-        #act = nn.PReLU()
 
         # url_name = 'r{}f{}x{}'.format(n_resblocks, n_feats, scale)
         # if url_name in url:
@@ -140,7 +137,7 @@ class EDSR(nn.Module):
         # define body module
         m_body = [
             ResBlock(
-                conv, n_feats, kernel_size, act=act, res_scale=args.res_scale
+                n_feats, kernel_size, res_scale=args.res_scale
             ) for _ in range(n_resblocks)
         ]
         # m_body.append(nn.Sequential(
@@ -157,10 +154,14 @@ class EDSR(nn.Module):
         self.head = nn.Sequential(*m_head)
         self.body = nn.Sequential(*m_body)
         self.tail = nn.Sequential(*m_tail)
-
+        self.k = 130
 
     def forward(self, x):
         x = self.sub_mean(x)
+
+        #residual alignment
+        x = x * self.k
+
         x = self.head(x)
 
         res = self.body(x)
@@ -169,6 +170,10 @@ class EDSR(nn.Module):
         if self.need_mid_feas:
             mid_feas = res
         x = self.tail(res)
+
+        #residual alignment
+        x = torch.div(x, self.k)
+
         x = self.add_mean(x)
         if self.need_mid_feas:
             return (x,mid_feas)

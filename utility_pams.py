@@ -1,11 +1,9 @@
-import copy
 import os
 import math
 import time
 import datetime
 from multiprocessing import Process
 from multiprocessing import Queue
-import cv2
 
 import matplotlib
 matplotlib.use('Agg')
@@ -13,15 +11,14 @@ import matplotlib.pyplot as plt
 
 import numpy as np
 import imageio
+import cv2
 
+import pdb
 import torch
 import torch.optim as optim
 import torch.optim.lr_scheduler as lrs
 
-from evaluate import new_psnr, new_ssim
-
-from tensorboardX import SummaryWriter
-import pdb
+from skimage.metrics import structural_similarity
 
 class timer():
     def __init__(self):
@@ -56,45 +53,33 @@ class checkpoint():
         self.log_ssim = torch.Tensor()
         now = datetime.datetime.now().strftime('%Y-%m-%d-%H:%M:%S')
 
-        # args.load和args.save都是experiment中的文件夹名字
-        #pdb.set_trace()
         if not args.load:
             if not args.save:
                 args.save = now
             self.dir = os.path.join('.', 'experiment', args.save)
             assert not os.path.exists(self.dir) or args.reset, 'the save dir {} has exist'.format(args.save)
         else:
-            self.dir = os.path.join('.', 'experiment', args.save)
-            assert not os.path.exists(self.dir) or args.reset, 'the save dir {} has exist'.format(args.save)
-            if os.path.exists(self.dir) and not args.test_only:
+            self.dir = os.path.join('.', 'experiment', args.load)
+            if os.path.exists(self.dir):
                 self.log = torch.load(self.get_path('psnr_log.pt'))
                 print('Continue from epoch {}...'.format(len(self.log)))
             else:
                 args.load = ''
-        # 设置Tensorboard文件的root目录
-        self.tb_dir = self.dir.replace('experiment', 'tensorboard_files')
 
         if args.reset:
-            assert not args.load and args.resume != -1
             os.system('rm -rf ' + self.dir)
-            os.system('rm -rf ' + self.tb_dir)
             args.load = ''
-
-        os.makedirs(os.path.join('..', 'tensorboard_files'), exist_ok=True)
-        os.makedirs(self.tb_dir, exist_ok=True)
-        self.tb_writer = SummaryWriter(log_dir=self.tb_dir)
 
         os.makedirs(self.dir, exist_ok=True)
         os.makedirs(self.get_path('model'), exist_ok=True)
         for d in args.data_test:
             os.makedirs(self.get_path('results-{}'.format(d)), exist_ok=True)
-
-        if args.test_only:
-            open_type = 'a' if os.path.exists(self.get_path('log_test.txt'))else 'w'
-            self.log_file = open(self.get_path('log_test.txt'), open_type)
-        else:
-            open_type = 'a' if os.path.exists(self.get_path('log.txt'))else 'w'
-            self.log_file = open(self.get_path('log.txt'), open_type)
+        os.makedirs(self.get_path('run'), exist_ok=True)
+        
+        open_type = 'a' if os.path.exists(self.get_path('log.txt'))else 'w'
+        self.log_file = open(self.get_path('log.txt'), open_type)
+        self.eval_file = open(self.get_path('eval.txt'), open_type)
+        
         with open(self.get_path('config.txt'), open_type) as f:
             f.write(now + '\n\n')
             for arg in vars(args):
@@ -128,18 +113,12 @@ class checkpoint():
             self.log_file.close()
             self.log_file = open(self.get_path('log.txt'), 'a')
 
-    def tb_write_log(self, name_value, step, prefix=''):
-        if prefix != '': prefix += '_'
-        for name in name_value:
-            value = name_value[name]
-            if isinstance(value, torch.Tensor):
-                if value.numel() != 1:
-                    value = value.mean()
-                value = value.item()
-            self.tb_writer.add_scalar(prefix + name, value, step)
+    def write_eval(self, log):
+        self.eval_file.write(log + '\n')
 
     def done(self):
         self.log_file.close()
+        self.eval_file.close()
 
     def plot_psnr(self, epoch):
         axis = np.linspace(1, epoch, epoch)
@@ -169,20 +148,6 @@ class checkpoint():
                     filename, tensor = queue.get()
                     if filename is None: break
                     imageio.imwrite(filename, tensor.numpy())
-                    #cv2.imwrite(filename, tensor)
-                    # cv2.imwrite(filename, tensor.numpy())
-                    # imagesc可视化图
-                    # fig = plt.figure()
-                    # fig.set_size_inches(1. * tensor.shape[0] / tensor.shape[1], 1, forward = False)
-                    # ax = plt.Axes(fig, [0., 0., 1., 1.])
-                    # ax.set_axis_off()
-                    # fig.add_axes(ax)
-                    # plt.imshow(tensor.numpy())
-                    # # plt.axis('off')
-                    # # plt.xticks([])
-                    # # plt.yticks([])
-                    # plt.savefig(filename, dpi = tensor.shape[0])
-                    # plt.close(fig)
         
         self.process = [
             Process(target=bg_target, args=(self.queue,)) \
@@ -203,110 +168,11 @@ class checkpoint():
                 '{}_x{}_'.format(filename, scale)
             )
 
-            if len(save_list)==3:
-                postfix = ('SR', 'LR', 'HR')
-            elif len(save_list)==5:
-                postfix = ('SR', 'LR', 'HR', 'LR_RGB', 'HR_RGB')
-            elif len(save_list)==6:
-                postfix = ('SR', 'LR', 'HR', 'LR_RGB', 'HR_RGB', 'MID_FEAS')
-            else:
-                assert False
-                postfix = ('SR_l', 'SR_r', 'LR_l', 'LR_r', 'HR_l', 'HR_r')
-            print(postfix)
+            postfix = ('SR', 'LR', 'HR')
             for v, p in zip(save_list, postfix):
                 normalized = v[0].mul(255 / self.args.rgb_range)
                 tensor_cpu = normalized.byte().permute(1, 2, 0).cpu()
                 self.queue.put(('{}{}.png'.format(filename, p), tensor_cpu))
-            # if not self.args.need_mid_feas:
-            #     return
-            # mid_feas = save_list[-1]
-            # mid_feas_sign = mid_feas.sign()
-            # print(mid_feas.shape)
-            # # mid_feas = (mid_feas - mid_feas.min(dim=[0,2,3])) / (mid_feas.max(dim=[0,2,3]) - mid_feas.min(dim=[0,2,3]))
-            # mid_feas = mid_feas.squeeze(0).mul(255 / self.args.rgb_range).cpu().clamp(0,1) * 255
-            # mid_feas_sign = mid_feas_sign.squeeze(0).mul(255 / self.args.rgb_range).cpu().clamp(0,1) * 255
-            # print(mid_feas_sign)
-            # for i in range(mid_feas.shape[0]):
-            #     show = mid_feas[i]
-            #     show = (show - show.min()) / (show.max()- show.min()) * 255
-            #     self.queue.put(('{}{}_original.png'.format(filename, i), show))
-            #     self.queue.put(('{}{}_sign.png'.format(filename, i), mid_feas_sign[i]))
-
-    def save_results_my(self, dataset, filename, save_list, scale, args):
-        if self.args.save_results:
-            filename = self.get_path(
-                'results-{}'.format(dataset.dataset.name),
-                '{}_x{}_'.format(filename, scale)
-            )
-
-            if len(save_list)==3:
-                postfix = ('SR', 'LR', 'HR')
-            elif len(save_list)==5:
-                postfix = ('SR', 'LR', 'HR', 'LR_RGB', 'HR_RGB')
-            elif len(save_list)==6:
-                postfix = ('SR', 'LR', 'HR', 'LR_RGB', 'HR_RGB', 'MID_FEAS')
-            else:
-                assert False
-            print(postfix)
-            imgname = filename.split('/')[-1]
-            filename = os.path.join('./imgs', dataset.dataset.name + '_' + imgname + self.args.model.split('_')[1] + '_')
-            hr_filename = os.path.join('./imgs', dataset.dataset.name + '_' + imgname)
-            print('here', filename)
-            # return
-            # for i,(v, p) in enumerate(zip(save_list, postfix)):
-            #     print(p, v.shape)
-            #     normalized = v[0].mul(255 / self.args.rgb_range)
-            #     tensor_cpu = normalized.byte().permute(1, 2, 0).cpu()
-            #     self.queue.put(('{}{}.png'.format(filename, p), tensor_cpu))
-            save_list = [i[0].mul(255 / self.args.rgb_range).byte().permute(1, 2, 0).cpu().numpy() for i in save_list]
-            sr, lr, hr, lr_ycbcr, hr_ycbcr = save_list
-            lr = cv2.resize(lr, (hr.shape[1], hr.shape[0]), interpolation=cv2.INTER_CUBIC)
-            sr_bicubic = cv2.resize(lr_ycbcr[:,:,0], (hr.shape[1], hr.shape[0]), interpolation=cv2.INTER_CUBIC)
-            print(sr_bicubic.shape, hr_ycbcr[0].shape)
-            psnr_bicubic, ssim_bicubic = new_psnr(hr_ycbcr[:,:,0], sr_bicubic, scale=scale, data_range=self.args.rgb_range, chop=False), new_ssim(hr_ycbcr[:,:,0], sr_bicubic, scale=scale, data_range=self.args.rgb_range, chop=False)
-            lr = np.expand_dims(lr, axis=2)
-            print(sr.shape)
-            sr_rgb = get_rgb(sr, hr_ycbcr)
-            hr_rgb = get_rgb(None, hr_ycbcr)
-            lr_rgb = get_rgb(lr, hr_ycbcr)
-            self.queue.put(('{}{}.png'.format(filename, 'SR'), sr_rgb))
-            self.queue.put(('{}{}.png'.format(hr_filename, 'HR'), hr_rgb))
-            self.queue.put(('{}{}.png'.format(hr_filename, 'LR'), lr_rgb))
-            return psnr_bicubic, ssim_bicubic
-
-
-def get_rgb(y, ycbcr):
-    rgb_show = copy.deepcopy(ycbcr)
-    if y is not None:
-        # y = y.squeeze().cpu().numpy()
-        rgb_show[:, :, 0] = y.squeeze(-1)
-    # rgb_show = rgb_show*255
-    # rgb_show = rgb_show.astype(np.uint8)
-    rgb_show = cv2.cvtColor(rgb_show, cv2.COLOR_YCrCb2RGB)
-    # return rgb_show
-    
-    # # Set14, baboon
-    # left_up = (80, 400)
-    # width_height = (80, 40)
-
-    # Urban100, img_004
-    left_up = (700, 400)
-    # left_up = (700, 460)
-    width_height = (80, 40)
-
-    right_bottom = (left_up[0]+width_height[0], left_up[1]+width_height[1])
-    print(left_up, right_bottom)
-    rgb_show_tangle = copy.deepcopy(rgb_show)
-    rgb_show_tangle = cv2.rectangle(rgb_show_tangle, left_up, right_bottom, (0,255,0), 4)
-    
-    toup_img = rgb_show_tangle[left_up[1]:right_bottom[1], left_up[0]:right_bottom[0], :]
-    toup_width = int(toup_img.shape[0]/toup_img.shape[1]*rgb_show.shape[1])
-    up_img = cv2.resize(toup_img, (rgb_show.shape[1], toup_width))
-    print(rgb_show.shape, up_img.shape)
-    print()
-    final_show = np.concatenate((rgb_show_tangle, up_img), 0)
-    return final_show
-
 
 def quantize(img, rgb_range):
     pixel_range = 255 / rgb_range
@@ -314,7 +180,6 @@ def quantize(img, rgb_range):
 
 def calc_psnr(sr, hr, scale, rgb_range, dataset=None):
     if hr.nelement() == 1: return 0
-
     diff = (sr - hr) / rgb_range
     if dataset and dataset.dataset.benchmark:
         shave = scale
@@ -325,13 +190,11 @@ def calc_psnr(sr, hr, scale, rgb_range, dataset=None):
     else:
         shave = scale + 6
 
-    valid = diff[..., shave:-shave, shave:-shave] #算psnr的时候忽略边上的几个pixel, 边界上信息不足 可能会出问题
-    # pdb.set_trace()
+    valid = diff[..., shave:-shave, shave:-shave]
     mse = valid.pow(2).mean()
 
     return -10 * math.log10(mse)
 
-# 以下函数参考utility_pams, 为了计算SSIM on Y channel
 def ssim(img1, img2):
     C1 = (0.01 * 255)**2
     C2 = (0.03 * 255)**2
@@ -353,7 +216,6 @@ def ssim(img1, img2):
     ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) *
                                                             (sigma1_sq + sigma2_sq + C2))
     return ssim_map.mean()
-
 
 def bgr2ycbcr(img, only_y=True):
     '''same as matlab rgb2ycbcr
@@ -405,7 +267,6 @@ def tensor2img(tensor, out_type=np.uint8, min_max=(0, 1)):
         # Important. Unlike matlab, numpy.unit8() WILL NOT round by default.
     return img_np.astype(out_type)
 
-
 def calc_ssim(img1, img2, scale):
     '''calculate SSIM
     the same outputs as MATLAB's
@@ -440,6 +301,25 @@ def calc_ssim(img1, img2, scale):
     else:
         raise ValueError('Wrong input image dimensions.')
 
+# e2fif中计算ssim用的函数
+def new_ssim(img_true, img_test, scale=2, data_range=256, chop=False):
+    if isinstance(img_true, torch.Tensor):
+        img_true, img_test = img_true.detach().cpu().numpy(), img_test.detach().cpu().numpy()
+    if len(img_true.shape)==4:
+        assert img_true.shape[0] == 1, 'compute the SSIM for batch data please use batch_psnr'
+        img_true, img_test = img_true.squeeze(0), img_test.squeeze(0)
+    if img_true.shape[0]==3:
+        img_true, img_test = img_true.transpose([1,2,0]), img_test.transpose([1,2,0])
+        return structural_similarity(img_true, img_test, win_size=11, data_range=data_range, gaussian_weights=True, multichannel=True)
+    elif img_true.shape[0]==1:
+        img_true, img_test = img_true[0], img_test[0]
+        # return structural_similarity(img_true, img_test, win_size=11, data_range=data_range, gaussian_weights=True)
+        return structural_similarity(img_true, img_test, win_size=11, data_range=data_range, gaussian_weights=True)
+    else:
+        return structural_similarity(img_true, img_test, win_size=11, data_range=data_range, gaussian_weights=True)
+        assert False
+
+
 
 def make_optimizer(args, target):
     '''
@@ -462,7 +342,6 @@ def make_optimizer(args, target):
 
     # scheduler
     milestones = list(map(lambda x: int(x), args.decay.split('-')))
-    print(milestones)
     kwargs_scheduler = {'milestones': milestones, 'gamma': args.gamma}
     scheduler_class = lrs.MultiStepLR
 
