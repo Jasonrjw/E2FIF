@@ -22,6 +22,8 @@ from evaluate import new_psnr, new_ssim
 
 from tensorboardX import SummaryWriter
 import pdb
+from skimage.metrics import structural_similarity
+
 
 class timer():
     def __init__(self):
@@ -362,20 +364,26 @@ def bgr2ycbcr(img, only_y=True):
         uint8, [0, 255]
         float, [0, 1]
     '''
-    in_img_type = img.dtype
+    in_img_type = img.dtype 
     img.astype(np.float32)
     if in_img_type != np.uint8:
         img *= 255.
     # convert
     if only_y:
         rlt = np.dot(img, [24.966, 128.553, 65.481]) / 255.0 + 16.0
+        #rlt = np.dot(img, [65.738, 129.057, 25.064]) / 256.0 + 16.0
+
     else:
         rlt = np.matmul(img, [[24.966, 112.0, -18.214], [128.553, -74.203, -93.786],
                               [65.481, -37.797, 112.0]]) / 255.0 + [16, 128, 128]
+        
+    #pdb.set_trace()
+
     if in_img_type == np.uint8:
         rlt = rlt.round()
     else:
         rlt /= 255.
+    #pdb.set_trace()
     return rlt.astype(in_img_type)
 
 
@@ -385,24 +393,33 @@ def tensor2img(tensor, out_type=np.uint8, min_max=(0, 1)):
     Input: 4D(B,(3/1),H,W), 3D(C,H,W), or 2D(H,W), any range, RGB channel order
     Output: 3D(H,W,C) or 2D(H,W), [0,255], np.uint8 (default)
     '''
-    tensor = tensor.squeeze().float().cpu().clamp_(*min_max)  # clamp
-    tensor = (tensor - min_max[0]) / (min_max[1] - min_max[0])  # to range [0,1]
+    #pdb.set_trace()
+    #tensor = tensor.squeeze().float().cpu().clamp_(*min_max)  # clamp 这里有问题，tensor原本是0-255的，这样会全被clamp到1
+    #tensor = (tensor - min_max[0]) / (min_max[1] - min_max[0])  # to range [0,1]
+    tensor = tensor.squeeze().float().cpu()
     n_dim = tensor.dim()
     if n_dim == 4:
         n_img = len(tensor)
         img_np = make_grid(tensor, nrow=int(math.sqrt(n_img)), normalize=False).numpy()
         img_np = np.transpose(img_np[[2, 1, 0], :, :], (1, 2, 0))  # HWC, BGR
+        #img_np = np.transpose(img_np, (1, 2, 0))  # HWC
+
     elif n_dim == 3:
         img_np = tensor.numpy()
         img_np = np.transpose(img_np[[2, 1, 0], :, :], (1, 2, 0))  # HWC, BGR
+        #img_np = np.transpose(img_np, (1, 2, 0))  # HWC
+
     elif n_dim == 2:
         img_np = tensor.numpy()
     else:
         raise TypeError(
             'Only support 4D, 3D and 2D tensor. But received with dimension: {:d}'.format(n_dim))
-    if out_type == np.uint8:
-        img_np = (img_np * 255.0).round()
+    
+    # if out_type == np.uint8:
+    #     img_np = (img_np * 255.0).round()
         # Important. Unlike matlab, numpy.unit8() WILL NOT round by default.
+    
+    #pdb.set_trace()
     return img_np.astype(out_type)
 
 
@@ -412,31 +429,35 @@ def calc_ssim(img1, img2, scale):
     img1, img2: [0, 255]
     '''
     shave = scale
-    
-    img1 = tensor2img(img1) / 255.
-    img2 = tensor2img(img2) / 255.
 
-    # print(img1.shape, img2.shape)
+    img1 = tensor2img(img1)
+    img2 = tensor2img(img2)
+    
+    # img1 = tensor2img(img1) / 255.
+    # img2 = tensor2img(img2) / 255.
+
+    #print('\n',img1.shape, img2.shape,'\n')
     # img1 = img1[shave:-shave, shave:-shave, :]
     # img2 = img2[shave:-shave, shave:-shave, :]
     
     img1 = bgr2ycbcr(img1) * 255
     img2 = bgr2ycbcr(img2) * 255
 
-    # print(img1.shape, img2.shape)
-
+    #print(img1.shape, img2.shape)  # ndim=2
+    #pdb.set_trace()
     if not img1.shape == img2.shape:
         raise ValueError('Input images must have the same dimensions.')
     if img1.ndim == 2:
-        return ssim(img1, img2)
+        #return ssim(img1, img2)
+        return structural_similarity(img1, img2, gaussian_weights=True)
     elif img1.ndim == 3:
         if img1.shape[2] == 3:
             ssims = []
             for i in range(3):
-                ssims.append(ssim(img1, img2))
+                ssims.append(structural_similarity(img1, img2))
             return np.array(ssims).mean()
         elif img1.shape[2] == 1:
-            return ssim(np.squeeze(img1), np.squeeze(img2))
+            return structural_similarity(np.squeeze(img1), np.squeeze(img2))
     else:
         raise ValueError('Wrong input image dimensions.')
 

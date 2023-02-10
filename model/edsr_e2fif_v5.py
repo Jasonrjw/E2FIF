@@ -51,6 +51,23 @@ class LearnableScale(nn.Module):
         return out
     
 
+class Channel_rescale(nn.Module):
+    def __init__(self, channel, reduction=8):
+        super().__init__()
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channel, channel // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channel // reduction, channel, bias=False),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y.expand_as(x)
+
 
 class BinaryConv(nn.Module):
     def __init__(self, in_chn, out_chn, kernel_size=3, stride=1, padding=1, bias=True):
@@ -122,14 +139,19 @@ class ResBlock(nn.Module):
             #nn.BatchNorm2d(n_feats)
         )
         self.res_scale = res_scale
+        self.crs1 = Channel_rescale(channel=n_feats, reduction=8)
+        self.crs2 = Channel_rescale(channel=n_feats, reduction=8)
 
     def forward(self, x):
-        # res = self.body(x).mul(self.res_scale)
-        # res += x
-        out = self.conv1(x).mul(self.res_scale) + x
-        out = self.act(out)
-        out = self.conv2(out).mul(self.res_scale) + out
-        return out
+        # out = self.conv1(x).mul(self.res_scale) + x
+        # out = self.act(out)
+        # out = self.conv2(out).mul(self.res_scale) + out
+        out1 = self.conv1(x).mul(self.res_scale)
+        out1 = self.crs1(out1) + x
+        out1 = self.act(out1)
+        out2 = self.conv2(out1).mul(self.res_scale) 
+        out2 = self.crs2(out2) + out1
+        return out2
 
 
 class EDSR(nn.Module):
